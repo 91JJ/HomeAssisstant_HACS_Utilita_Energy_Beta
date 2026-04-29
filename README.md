@@ -1,5 +1,7 @@
 
-![logo](https://github.com/user-attachments/assets/2f0704e1-80c1-4f1c-8116-b4d986156947)
+<p align="center">
+	<img src="custom_components/utilita/logo/utilita_logo.png" alt="Utilita logo" width="500">
+</p>
 
 # Utilita Energy Integration for Home Assistant
 
