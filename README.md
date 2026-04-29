@@ -22,7 +22,7 @@ After entering the OTP code, the integration should be created :smiley:.
 1. Open HACS.
 2. Go to **Integrations**.
 3. Select the three-dot menu, then **Custom repositories**.
-4. Add `https://github.com/91JJ/HomeAssisstant_Utilita_Energy_Beta` as an **Integration** repository.
+4. Add `https://github.com/91JJ/HomeAssisstant_HACS_Utilita_Energy_Beta` as an **Integration** repository.
 5. Search for **Utilita Energy** in HACS and install it.
 6. Restart Home Assistant.
 7. Go to **Settings > Devices & Services > Add Integration** and search for **Utilita Energy**.
