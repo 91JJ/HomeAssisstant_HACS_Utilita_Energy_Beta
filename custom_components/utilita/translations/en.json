@@ -1,0 +1,51 @@
+{
+  "title": "Utilita Energy",
+  "config": {
+    "abort": {
+      "already_configured": "This Utilita account is already configured."
+    },
+    "step": {
+      "user": {
+        "title": "Connect to Utilita Energy",
+        "description": "Enter your Utilita account details.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "refresh_rate": "Refresh rate (seconds)"
+        }
+      },
+      "mfa_method": {
+        "title": "Choose MFA method",
+        "description": "Please choose how you would like to receive your security code.",
+        "data": {
+          "mfa_method": "MFA method"
+        }
+      },
+      "otp": {
+        "title": "Enter security code",
+        "description": "Enter the 6-digit security code sent to {target}.",
+        "data": {
+          "otp_code": "Security code"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Utilita.",
+      "invalid_auth": "Invalid email or password.",
+      "otp_failed": "Failed to send the security code.",
+      "invalid_otp": "Invalid security code.",
+      "unknown": "An unexpected error occurred."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Utilita Energy options",
+        "description": "Adjust how often data is refreshed.",
+        "data": {
+          "refresh_rate": "Refresh rate (seconds)"
+        }
+      }
+    }
+  }
+}
