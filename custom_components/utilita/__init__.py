@@ -14,6 +14,15 @@ import asyncio
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _log_session_state(cookies, cache_session):
+    """Return a redacted description of the current session state."""
+    return {
+        "cookie_count": len(cookies),
+        "cookie_names": sorted(cookies.keys()) if isinstance(cookies, dict) else [],
+        "has_cache_session": bool(cache_session),
+    }
+
 class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Utilita data with session persistence."""
 
@@ -49,7 +58,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             if response.status != 200:
                 raise UpdateFailed(f"Failed to load login page: HTTP {response.status}, URL: {response.url}")
             login_page = await response.text()
-            _LOGGER.debug(f"Login page URL: {response.url}, Headers: {response.headers}")
+            _LOGGER.debug(f"Login page URL: {response.url}")
             match = re.search(r'<input type="hidden" name="_token" value="([^"]+)"', login_page)
             if not match:
                 match = re.search(r'<meta name="csrf-token" content="([^"]+)"', login_page, re.IGNORECASE)
@@ -58,15 +67,14 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.error(f"CSRF token not found. Login page snippet: {snippet}")
                 raise UpdateFailed("CSRF token not found")
             token = match.group(1)
-            _LOGGER.debug(f"CSRF token found: {token[:10]}...")
+            _LOGGER.debug("CSRF token found")
             xsrf_token = None
             for cookie in response.cookies.values():
                 if cookie.key == "XSRF-TOKEN" and "my.utilita.co.uk" in cookie["domain"]:
                     xsrf_token = cookie.value
-                    _LOGGER.debug(f"XSRF token found: {xsrf_token[:10]}...")
+                    _LOGGER.debug("XSRF token found")
                     break
-            cookies = [f"{cookie.key}={cookie.value}" for cookie in response.cookies.values()]
-            _LOGGER.debug(f"Cookies after login page: {cookies}")
+            _LOGGER.debug(f"Cookies received after login page: {len(response.cookies)}")
 
         async with session.post(
             "https://my.utilita.co.uk/login",
@@ -85,8 +93,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             response_text = await response.text()
             if response.status != 200:
                 raise UpdateFailed(f"Login failed: HTTP {response.status}, URL: {response.url}")
-            cookies = [f"{cookie.key}={cookie.value}" for cookie in response.cookies.values()]
-            _LOGGER.debug(f"Cookies after login: {cookies}")
+            _LOGGER.debug(f"Cookies received after login: {len(response.cookies)}")
             if "otp-login" in str(response.url) or "otp-login" in response_text or "#OTP-form" in str(response.url):
                 self.retry_attempts += 1
                 # Exponential backoff: 5min, 15min, 30min, 60min
@@ -108,7 +115,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             # Update cookies and cache session
             self.cookies = {cookie.key: cookie.value for cookie in response.cookies.values() if "my.utilita.co.uk" in cookie["domain"]}
             self.cache_session = response.headers.get("Cache-Session", self.cache_session)
-            _LOGGER.debug(f"Updated session cookies: {self.cookies}, Cache-Session: {self.cache_session}")
+            _LOGGER.debug(f"Updated session state: {_log_session_state(self.cookies, self.cache_session)}")
             self.session_validated = True
             self.last_session_check = time.time()
             # Save updated cookies and cache session to config entry
@@ -186,7 +193,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
                 session = aiohttp_client.async_get_clientsession(self.hass)
                 if self.cookies:
                     session.cookie_jar.update_cookies(self.cookies, URL("https://my.utilita.co.uk"))
-                    _LOGGER.debug(f"Loaded cookies for session: {self.cookies}, Cache-Session: {self.cache_session}")
+                    _LOGGER.debug(f"Loaded stored session state: {_log_session_state(self.cookies, self.cache_session)}")
                     if not self.session_validated or (time.time() - self.last_session_check) > 3600:
                         self.session_validated = await self._async_validate_session(session)
                         self.last_session_check = time.time()
