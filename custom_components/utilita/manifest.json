@@ -1,0 +1,12 @@
+{
+  "domain": "utilita",
+  "name": "Utilita Energy",
+  "version": "2.1.0",
+  "documentation": "https://github.com/91JJ/HomeAssisstant_HACS_Utilita_Energy_Beta",
+  "issue_tracker": "https://github.com/91JJ/HomeAssisstant_HACS_Utilita_Energy_Beta/issues",
+  "requirements": [],
+  "codeowners": ["@91JJ"],
+  "iot_class": "cloud_polling",
+  "config_flow": true,
+  "integration_type": "service"
+}
