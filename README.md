@@ -1,6 +1,6 @@
 
 <p align="center">
-	<img src="[custom_components/utilita/logo/utilita_logo.png](https://raw.githubusercontent.com/91JJ/HomeAssisstant_HACS_Utilita_Energy_Beta/main/custom_components/utilita/logo/utilita_logo.png)" alt="Utilita logo" width="500">
+	<img src="https://raw.githubusercontent.com/91JJ/HomeAssisstant_HACS_Utilita_Energy_Beta/main/custom_components/utilita/logo/utilita_logo.png" alt="Utilita logo" width="500">
 </p>
 
 # Utilita Energy Integration for Home Assistant
