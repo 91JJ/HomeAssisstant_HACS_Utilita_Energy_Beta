@@ -1,5 +1,6 @@
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import aiohttp_client
 import re
@@ -37,13 +38,22 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         self.session_validated = False
         self.last_session_check = 0
         self.retry_attempts = 0
+        self._ping_task = None
         super().__init__(
             hass,
             _LOGGER,
             name=f"Utilita_{entry.entry_id}",
             update_interval=timedelta(seconds=entry.options.get(CONF_REFRESH_RATE, entry.data.get(CONF_REFRESH_RATE, 7200))),
         )
-        self._ping_task = self.hass.async_create_task(self._async_keep_alive())
+
+    def async_start_keep_alive(self, _event=None):
+        """Start the keep-alive task once Home Assistant is running."""
+        if self._ping_task and not self._ping_task.done():
+            return
+        self._ping_task = self.hass.async_create_background_task(
+            self._async_keep_alive(),
+            f"{DOMAIN}_keep_alive_{self.config_entry.entry_id}",
+        )
 
     async def _async_login(self, session):
         """Perform login to refresh session."""
@@ -319,6 +329,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
+
+    if hass.is_running:
+        coordinator.async_start_keep_alive()
+    else:
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED,
+                coordinator.async_start_keep_alive,
+            )
+        )
+
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
