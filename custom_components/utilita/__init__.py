@@ -1,9 +1,7 @@
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import aiohttp_client
-from homeassistant.helpers.event import async_track_time_interval
 import re
 import logging
 from datetime import timedelta, date, datetime
@@ -11,7 +9,6 @@ from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REFRESH_RATE
 import json
 import async_timeout
 import time
-from asyncio import CancelledError
 from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,37 +36,11 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         self.session_validated = False
         self.last_session_check = 0
         self.retry_attempts = 0
-        self._ping_task = None
-        self._cancel_keep_alive = None
         super().__init__(
             hass,
             _LOGGER,
             name=f"Utilita_{entry.entry_id}",
             update_interval=timedelta(seconds=entry.options.get(CONF_REFRESH_RATE, entry.data.get(CONF_REFRESH_RATE, 7200))),
-        )
-
-    def async_start_keep_alive(self, _event=None):
-        """Start the keep-alive scheduler once Home Assistant is running."""
-        if self._cancel_keep_alive is not None:
-            return
-
-        self._cancel_keep_alive = async_track_time_interval(
-            self.hass,
-            self._async_schedule_keep_alive,
-            timedelta(minutes=5),
-        )
-        self.hass.async_create_background_task(
-            self._async_keep_alive_ping(),
-            f"{DOMAIN}_keep_alive_{self.config_entry.entry_id}",
-        )
-
-    async def _async_schedule_keep_alive(self, _now):
-        """Schedule a keep-alive ping if one is not already running."""
-        if self._ping_task and not self._ping_task.done():
-            return
-        self._ping_task = self.hass.async_create_background_task(
-            self._async_keep_alive_ping(),
-            f"{DOMAIN}_keep_alive_{self.config_entry.entry_id}",
         )
 
     async def _async_login(self, session):
@@ -154,42 +125,6 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
                     "cache_session": self.cache_session,
                 }
             )
-
-    async def _async_keep_alive_ping(self):
-        """Ping /json/scroller once to keep the session alive."""
-        try:
-            if not self.session_validated or not self.cookies:
-                _LOGGER.debug("Skipping keep-alive ping: session not validated or no cookies")
-                return
-
-            session = aiohttp_client.async_get_clientsession(self.hass)
-            session.cookie_jar.update_cookies(self.cookies, URL("https://my.utilita.co.uk"))
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-GB,en;q=0.9",
-                "Referer": f"https://my.utilita.co.uk/energy?cache={self.cache_session}",
-                "X-App-Name": "my.utilita",
-                "X-App-Version": "production",
-                "X-Requested-With": "XMLHttpRequest",
-                "Cache-Session": self.cache_session,
-                "X-CSRF-TOKEN": self.cookies.get("csrf_token", ""),
-                "X-XSRF-TOKEN": self.cookies.get("XSRF-TOKEN", ""),
-                "Sec-Ch-Ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-            }
-            async with session.get("https://my.utilita.co.uk/json/scroller", timeout=10, headers=headers) as response:
-                response_text = await response.text()
-                _LOGGER.debug(f"Keep-alive ping response: HTTP {response.status}, URL: {response.url}, Response: {response_text[:1000]}")
-                if response.status == 401:
-                    _LOGGER.debug("Session invalid during keep-alive, marking for re-authentication")
-                    self.session_validated = False
-                elif response.status != 200:
-                    _LOGGER.warning(f"Keep-alive ping failed: HTTP {response.status}")
-                self.cache_session = response.headers.get("Cache-Session", self.cache_session)
-        except Exception:
-            _LOGGER.exception("Error during keep-alive ping")
 
     async def _async_validate_session(self, session):
         """Validate session by checking a lightweight endpoint."""
@@ -307,16 +242,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Error fetching data: {err}")
 
     async def async_unload(self):
-        """Unload the coordinator and cancel keep-alive work."""
-        if self._cancel_keep_alive:
-            self._cancel_keep_alive()
-            self._cancel_keep_alive = None
-        if self._ping_task:
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except CancelledError:
-                pass
+        """Unload the coordinator."""
         await super().async_unload()
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -347,16 +273,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-
-    if hass.is_running:
-        coordinator.async_start_keep_alive()
-    else:
-        entry.async_on_unload(
-            hass.bus.async_listen_once(
-                EVENT_HOMEASSISTANT_STARTED,
-                coordinator.async_start_keep_alive,
-            )
-        )
 
     return True
 
