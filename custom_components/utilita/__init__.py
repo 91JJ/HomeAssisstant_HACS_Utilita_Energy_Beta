@@ -28,6 +28,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
     def __init__(self, hass, entry):
         """Initialize."""
         self.hass = hass
+        self.config_entry = entry
         self.email = entry.data[CONF_EMAIL]
         self.password = entry.data[CONF_PASSWORD]
         self.cookies = entry.data.get("cookies", {})
@@ -42,6 +43,76 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             name=f"Utilita_{entry.entry_id}",
             update_interval=timedelta(seconds=entry.options.get(CONF_REFRESH_RATE, entry.data.get(CONF_REFRESH_RATE, 7200))),
         )
+
+    def _async_apply_cookies(self, session):
+        """Apply stored cookies to the shared HTTP session."""
+        if self.cookies:
+            session.cookie_jar.update_cookies(self.cookies, URL("https://my.utilita.co.uk"))
+
+    def _build_api_headers(self, accept="application/json"):
+        """Build standard authenticated headers for Utilita API requests."""
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept": accept,
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Referer": f"https://my.utilita.co.uk/energy?cache={self.cache_session}",
+            "Connection": "keep-alive",
+            "Cache-Session": self.cache_session,
+            "X-App-Name": "my.utilita",
+            "X-App-Version": "production",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-TOKEN": self.cookies.get("csrf_token", ""),
+            "X-XSRF-TOKEN": self.cookies.get("XSRF-TOKEN", ""),
+        }
+
+    async def _async_ensure_authenticated(self, session):
+        """Ensure the stored session is valid, logging in again if needed."""
+        if self.login_retry_after and time.time() < self.login_retry_after:
+            expiry = datetime.fromtimestamp(self.login_retry_after).strftime('%Y-%m-%d %H:%M:%S')
+            _LOGGER.warning(f"Login retry delay in effect until {expiry}. Skipping login.")
+            raise UpdateFailed(f"Login retry delay in effect until {expiry}. Please try again later.")
+
+        self._async_apply_cookies(session)
+
+        if not self.cookies:
+            _LOGGER.debug("No stored cookies, proceeding with login.")
+            await self._async_login(session)
+            return
+
+        _LOGGER.debug(f"Loaded stored session state: {_log_session_state(self.cookies, self.cache_session)}")
+        if not self.session_validated or (time.time() - self.last_session_check) > 3600:
+            self.session_validated = await self._async_validate_session(session)
+            self.last_session_check = time.time()
+            _LOGGER.debug(f"Session validation result: {self.session_validated}")
+            if not self.session_validated:
+                _LOGGER.debug("Session invalid, attempting to log in again.")
+                await self._async_login(session)
+
+    async def _async_request(self, session, url, error_message, response_type="json"):
+        """Perform an authenticated GET request, retrying once after re-login on 401."""
+        headers = self._build_api_headers(
+            accept="application/json" if response_type == "json" else "text/plain, */*"
+        )
+
+        async with session.get(url, timeout=10, headers=headers) as response:
+            if response.status == 401:
+                _LOGGER.debug(f"Session invalid during request to {url}, attempting to log in again.")
+                self.session_validated = False
+                await self._async_login(session)
+                retry_headers = self._build_api_headers(
+                    accept="application/json" if response_type == "json" else "text/plain, */*"
+                )
+                async with session.get(url, timeout=10, headers=retry_headers) as retry_response:
+                    if retry_response.status != 200:
+                        raise UpdateFailed(f"{error_message} after login: HTTP {retry_response.status}")
+                    self.cache_session = retry_response.headers.get("Cache-Session", self.cache_session)
+                    return await retry_response.json() if response_type == "json" else await retry_response.text()
+
+            if response.status != 200:
+                raise UpdateFailed(f"{error_message}: HTTP {response.status}")
+
+            self.cache_session = response.headers.get("Cache-Session", self.cache_session)
+            return await response.json() if response_type == "json" else await response.text()
 
     async def _async_login(self, session):
         """Perform login to refresh session."""
@@ -128,6 +199,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_validate_session(self, session):
         """Validate session by checking a lightweight endpoint."""
+        self._async_apply_cookies(session)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             "Accept": "application/json",
@@ -144,86 +216,46 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch data from Utilita."""
         _LOGGER.debug(f"Starting data update for entry {self.config_entry.entry_id} at {date.today()} {self.update_interval}")
         try:
-            async with async_timeout.timeout(10):
-                if self.login_retry_after and time.time() < self.login_retry_after:
-                    expiry = datetime.fromtimestamp(self.login_retry_after).strftime('%Y-%m-%d %H:%M:%S')
-                    _LOGGER.warning(f"Login retry delay in effect until {expiry}. Skipping login.")
-                    raise UpdateFailed(f"Login retry delay in effect until {expiry}. Please try again later.")
-
+            async with async_timeout.timeout(30):
                 session = aiohttp_client.async_get_clientsession(self.hass)
-                if self.cookies:
-                    session.cookie_jar.update_cookies(self.cookies, URL("https://my.utilita.co.uk"))
-                    _LOGGER.debug(f"Loaded stored session state: {_log_session_state(self.cookies, self.cache_session)}")
-                    if not self.session_validated or (time.time() - self.last_session_check) > 3600:
-                        self.session_validated = await self._async_validate_session(session)
-                        self.last_session_check = time.time()
-                        _LOGGER.debug(f"Session validation result: {self.session_validated}")
-                        if not self.session_validated:
-                            _LOGGER.debug("Session invalid, attempting to log in again.")
-                            await self._async_login(session)
-                else:
-                    _LOGGER.debug("No stored cookies, proceeding with login.")
-                    await self._async_login(session)
+                await self._async_ensure_authenticated(session)
 
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "Accept": "application/json",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Referer": f"https://my.utilita.co.uk/energy?cache={self.cache_session}",
-                    "Connection": "keep-alive",
-                    "Cache-Session": self.cache_session,
-                    "X-App-Name": "my.utilita",
-                    "X-App-Version": "production",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "X-CSRF-TOKEN": self.cookies.get("csrf_token", ""),
-                    "X-XSRF-TOKEN": self.cookies.get("XSRF-TOKEN", ""),
-                }
+                balance = await self._async_request(
+                    session,
+                    "https://my.utilita.co.uk/json/balance",
+                    "Failed to fetch balance",
+                )
+                _LOGGER.debug(f"Balance API response: {json.dumps(balance, indent=2)}")
 
-                # Fetch balance data
-                async with session.get("https://my.utilita.co.uk/json/balance", timeout=10, headers=headers) as response:
-                    if response.status == 401:
-                        _LOGGER.debug("Session invalid, attempting to log in again.")
-                        self.session_validated = False
-                        await self._async_login(session)
-                        async with session.get("https://my.utilita.co.uk/json/balance", timeout=10, headers=headers) as retry_response:
-                            if retry_response.status != 200:
-                                raise UpdateFailed(f"Failed to fetch balance after login: HTTP {retry_response.status}")
-                            balance = await retry_response.json()
-                            _LOGGER.debug(f"Balance API response: {json.dumps(balance, indent=2)}")
-                    elif response.status != 200:
-                        raise UpdateFailed(f"Failed to fetch balance: HTTP grs{response.status}")
-                    else:
-                        balance = await response.json()
-                        _LOGGER.debug(f"Balance API response: {json.dumps(balance, indent=2)}")
+                usage = await self._async_request(
+                    session,
+                    f"https://my.utilita.co.uk/json/usage?end_date={date.today()}",
+                    "Failed to fetch usage",
+                )
 
-                # Fetch usage data
-                async with session.get(f"https://my.utilita.co.uk/json/usage?end_date={date.today()}", timeout=10, headers=headers) as response:
-                    if response.status != 200:
-                        raise UpdateFailed(f"Failed to fetch usage: HTTP {response.status}")
-                    usage = await response.json()
+                user_data = await self._async_request(
+                    session,
+                    "https://my.utilita.co.uk/user-data",
+                    "Failed to fetch user data",
+                )
 
-                # Fetch user data
-                async with session.get("https://my.utilita.co.uk/user-data", timeout=10, headers=headers) as response:
-                    if response.status != 200:
-                        raise UpdateFailed(f"Failed to fetch user data: HTTP {response.status}")
-                    user_data = await response.json()
+                payments = await self._async_request(
+                    session,
+                    "https://my.utilita.co.uk/json/payments?page=1&per_page=50",
+                    "Failed to fetch payments",
+                )
 
-                # Fetch payments data
-                async with session.get("https://my.utilita.co.uk/json/payments?page=1&per_page=50", timeout=10, headers=headers) as response:
-                    if response.status != 200:
-                        raise UpdateFailed(f"Failed to fetch payments: HTTP {response.status}")
-                    payments = await response.json()
-
-                # Fetch unread messages count
-                async with session.get("https://my.utilita.co.uk/messages-unread", timeout=10, headers=headers) as response:
-                    if response.status != 200:
-                        raise UpdateFailed(f"Failed to fetch unread messages: HTTP {response.status}")
-                    messages_unread = await response.text()
-                    try:
-                        messages_unread = int(messages_unread.strip())
-                    except ValueError:
-                        _LOGGER.error(f"Invalid unread messages response: {messages_unread}")
-                        messages_unread = 0
+                messages_unread = await self._async_request(
+                    session,
+                    "https://my.utilita.co.uk/messages-unread",
+                    "Failed to fetch unread messages",
+                    response_type="text",
+                )
+                try:
+                    messages_unread = int(messages_unread.strip())
+                except ValueError:
+                    _LOGGER.error(f"Invalid unread messages response: {messages_unread}")
+                    messages_unread = 0
 
                 _LOGGER.debug(f"Data update completed successfully for entry {self.config_entry.entry_id}")
                 self.login_retry_after = None  # Reset retry delay on success
@@ -237,8 +269,18 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
                     "payments": payments,
                     "messages_unread": messages_unread
                 }
+        except TimeoutError as err:
+            _LOGGER.warning(
+                "Timed out fetching data for entry %s after 30 seconds",
+                self.config_entry.entry_id,
+            )
+            raise UpdateFailed("Timed out fetching data from Utilita") from err
         except Exception as err:
-            _LOGGER.error(f"Error fetching data for entry {self.config_entry.entry_id}: {err}")
+            _LOGGER.exception(
+                "Error fetching data for entry %s (%s)",
+                self.config_entry.entry_id,
+                type(err).__name__,
+            )
             raise UpdateFailed(f"Error fetching data: {err}")
 
     async def async_unload(self):
