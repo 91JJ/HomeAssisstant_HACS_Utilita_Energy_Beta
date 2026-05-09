@@ -153,6 +153,7 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_PASSWORD: self._password,
                         CONF_REFRESH_RATE: self._refresh_rate,
                         "cookies": {cookie.name: cookie.value for cookie in self._cookie_jar if "my.utilita.co.uk" in cookie.domain},
+                        "cache_session": response_headers.get("Cache-Session", ""),
                     },
                 )
 
@@ -258,7 +259,7 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 }).encode("utf-8")
 
                 try:
-                    status, response_text, _, _ = await self.hass.async_add_executor_job(
+                    status, response_text, _, response_headers = await self.hass.async_add_executor_job(
                         self._make_request,
                         "https://my.utilita.co.uk/login/otp",
                         "POST",
@@ -274,6 +275,7 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                                 CONF_PASSWORD: self._password,
                                 CONF_REFRESH_RATE: self._refresh_rate,
                                 "cookies": {cookie.name: cookie.value for cookie in self._cookie_jar if "my.utilita.co.uk" in cookie.domain},
+                                "cache_session": response_headers.get("Cache-Session", ""),
                             },
                         )
                 except Exception:
