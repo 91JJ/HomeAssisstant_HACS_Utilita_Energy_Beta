@@ -1,7 +1,8 @@
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers.event import async_track_time_interval
 import re
 import logging
 from datetime import timedelta, date, datetime
@@ -12,6 +13,8 @@ import time
 from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
+UTILITA_BASE_URL = URL("https://my.utilita.co.uk")
+SESSION_KEEPALIVE_INTERVAL = timedelta(minutes=30)
 
 
 def _log_session_state(cookies, cache_session):
@@ -37,6 +40,8 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         self.session_validated = False
         self.last_session_check = 0
         self.retry_attempts = 0
+        self._keepalive_unsub = None
+        self._keepalive_in_progress = False
         super().__init__(
             hass,
             _LOGGER,
@@ -47,7 +52,99 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
     def _async_apply_cookies(self, session):
         """Apply stored cookies to the shared HTTP session."""
         if self.cookies:
-            session.cookie_jar.update_cookies(self.cookies, URL("https://my.utilita.co.uk"))
+            session.cookie_jar.update_cookies(self.cookies, UTILITA_BASE_URL)
+
+    def _get_session_cookies(self, session):
+        """Return cookies currently stored for the Utilita domain."""
+        return {
+            name: morsel.value
+            for name, morsel in session.cookie_jar.filter_cookies(UTILITA_BASE_URL).items()
+        }
+
+    def _async_store_session(self, session, cache_session=None):
+        """Persist the latest session cookies and cache token."""
+        cookies = self._get_session_cookies(session)
+        if cookies:
+            self.cookies = cookies
+        if cache_session:
+            self.cache_session = cache_session
+
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={
+                **self.config_entry.data,
+                "cookies": self.cookies,
+                "cache_session": self.cache_session,
+            },
+        )
+
+    def _should_enable_keepalive(self):
+        """Return whether a lightweight keepalive is needed between refreshes."""
+        return self.update_interval is not None and self.update_interval > timedelta(minutes=45)
+
+    @callback
+    def _async_keepalive_listener(self, _now):
+        """Schedule a lightweight keepalive check."""
+        if self._keepalive_in_progress or not self.cookies:
+            return
+        self.hass.async_create_task(self._async_keep_session_alive())
+
+    @callback
+    def _async_configure_keepalive(self):
+        """Start or stop keepalive scheduling based on refresh interval."""
+        if self._keepalive_unsub is not None:
+            self._keepalive_unsub()
+            self._keepalive_unsub = None
+
+        if self._should_enable_keepalive():
+            self._keepalive_unsub = async_track_time_interval(
+                self.hass,
+                self._async_keepalive_listener,
+                SESSION_KEEPALIVE_INTERVAL,
+            )
+
+    async def _async_keep_session_alive(self):
+        """Touch a lightweight endpoint to avoid idle-session expiry."""
+        if self._keepalive_in_progress or not self.cookies:
+            return
+
+        if self.login_retry_after and time.time() < self.login_retry_after:
+            return
+
+        self._keepalive_in_progress = True
+        try:
+            session = aiohttp_client.async_get_clientsession(self.hass)
+            self._async_apply_cookies(session)
+            headers = self._build_api_headers()
+            async with async_timeout.timeout(15):
+                async with session.get(
+                    "https://my.utilita.co.uk/user-data",
+                    timeout=10,
+                    headers=headers,
+                ) as response:
+                    if response.status == 200:
+                        self.session_validated = True
+                        self.last_session_check = time.time()
+                        self._async_store_session(
+                            session,
+                            response.headers.get("Cache-Session", self.cache_session),
+                        )
+                        _LOGGER.debug("Utilita keepalive succeeded for entry %s", self.config_entry.entry_id)
+                    else:
+                        self.session_validated = False
+                        _LOGGER.debug(
+                            "Utilita keepalive returned HTTP %s for entry %s",
+                            response.status,
+                            self.config_entry.entry_id,
+                        )
+        except Exception as err:
+            _LOGGER.debug(
+                "Utilita keepalive skipped after %s for entry %s",
+                type(err).__name__,
+                self.config_entry.entry_id,
+            )
+        finally:
+            self._keepalive_in_progress = False
 
     def _build_api_headers(self, accept="application/json"):
         """Build standard authenticated headers for Utilita API requests."""
@@ -105,13 +202,19 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
                 async with session.get(url, timeout=10, headers=retry_headers) as retry_response:
                     if retry_response.status != 200:
                         raise UpdateFailed(f"{error_message} after login: HTTP {retry_response.status}")
-                    self.cache_session = retry_response.headers.get("Cache-Session", self.cache_session)
+                    self._async_store_session(
+                        session,
+                        retry_response.headers.get("Cache-Session", self.cache_session),
+                    )
                     return await retry_response.json() if response_type == "json" else await retry_response.text()
 
             if response.status != 200:
                 raise UpdateFailed(f"{error_message}: HTTP {response.status}")
 
-            self.cache_session = response.headers.get("Cache-Session", self.cache_session)
+            self._async_store_session(
+                session,
+                response.headers.get("Cache-Session", self.cache_session),
+            )
             return await response.json() if response_type == "json" else await response.text()
 
     async def _async_login(self, session):
@@ -138,8 +241,8 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             token = match.group(1)
             _LOGGER.debug("CSRF token found")
             xsrf_token = None
-            for cookie in response.cookies.values():
-                if cookie.key == "XSRF-TOKEN" and "my.utilita.co.uk" in cookie["domain"]:
+            for cookie in session.cookie_jar.filter_cookies(UTILITA_BASE_URL).values():
+                if cookie.key == "XSRF-TOKEN":
                     xsrf_token = cookie.value
                     _LOGGER.debug("XSRF token found")
                     break
@@ -182,20 +285,13 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             # Reset retry attempts on successful login
             self.retry_attempts = 0
             # Update cookies and cache session
-            self.cookies = {cookie.key: cookie.value for cookie in response.cookies.values() if "my.utilita.co.uk" in cookie["domain"]}
-            self.cache_session = response.headers.get("Cache-Session", self.cache_session)
+            self._async_store_session(
+                session,
+                response.headers.get("Cache-Session", self.cache_session),
+            )
             _LOGGER.debug(f"Updated session state: {_log_session_state(self.cookies, self.cache_session)}")
             self.session_validated = True
             self.last_session_check = time.time()
-            # Save updated cookies and cache session to config entry
-            self.hass.config_entries.async_update_entry(
-                self.config_entry,
-                data={
-                    **self.config_entry.data,
-                    "cookies": self.cookies,
-                    "cache_session": self.cache_session,
-                }
-            )
 
     async def _async_validate_session(self, session):
         """Validate session by checking a lightweight endpoint."""
@@ -210,6 +306,11 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         }
         async with session.get("https://my.utilita.co.uk/user-data", timeout=10, headers=headers) as response:
             _LOGGER.debug(f"Session validation response: HTTP {response.status}, URL: {response.url}")
+            if response.status == 200:
+                self._async_store_session(
+                    session,
+                    response.headers.get("Cache-Session", self.cache_session),
+                )
             return response.status == 200
 
     async def _async_update_data(self):
@@ -285,6 +386,9 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_unload(self):
         """Unload the coordinator."""
+        if self._keepalive_unsub is not None:
+            self._keepalive_unsub()
+            self._keepalive_unsub = None
         await super().async_unload()
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -300,6 +404,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not coordinator.last_update_success:
         _LOGGER.error(f"Initial refresh failed for entry {entry.entry_id}")
         return False
+    coordinator._async_configure_keepalive()
 
     # Explicitly create the device (fixes the missing device issue in HA 2025.x)
     from homeassistant.helpers import device_registry as dr
@@ -334,5 +439,6 @@ async def async_options_updated(hass, entry):
         if coordinator:
             new_refresh_rate = entry.options.get(CONF_REFRESH_RATE, 7200)
             coordinator.update_interval = timedelta(seconds=new_refresh_rate)
+            coordinator._async_configure_keepalive()
             await coordinator.async_request_refresh()
     return True
