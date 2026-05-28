@@ -1,16 +1,31 @@
+"""Config flow for the Utilita Energy integration."""
+import logging
+
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
-import re
-import logging
-import urllib.request
-import urllib.parse
-import json
-from http.cookiejar import CookieJar
-from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REFRESH_RATE
+from homeassistant.helpers import aiohttp_client
+from yarl import URL
+
+from .const import CONF_REFRESH_RATE, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+_UTILITA_BASE = "https://my.utilita.co.uk"
+_CONF_COOKIES_RAW = "cookies_raw"
+
+
+def _parse_cookie_string(raw: str) -> dict:
+    """Parse a semicolon-separated Cookie header string into a name->value dict."""
+    result = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            result[name.strip()] = value.strip()
+    return result
+
 
 class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Utilita."""
@@ -19,152 +34,88 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
 
     def __init__(self):
-        """Initialize the config flow."""
-        self._email = None
-        self._password = None
-        self._refresh_rate = None
-        self._token = None
-        self._xsrf_token = None
-        self._cookie_jar = CookieJar()
-        self._mfa_method = None          # "sms" or "email"
-        self._mfa_target_display = None  # what to show in the OTP step ("admin@homeassistant.com or "your registered mobile number")
+        """Initialise the config flow."""
+        self._cookies: dict = {}
+        self._cache_session: str = ""
+        self._reauth_entry = None
 
     @staticmethod
-    def _user_schema(default_refresh_rate=7200):
+    def _user_schema(default_refresh_rate: int = 7200) -> vol.Schema:
         """Return the schema for the user step."""
         return vol.Schema(
             {
-                vol.Required(CONF_EMAIL): str,
-                vol.Required(CONF_PASSWORD): str,
+                vol.Required(_CONF_COOKIES_RAW): str,
                 vol.Required(CONF_REFRESH_RATE, default=default_refresh_rate): vol.All(
                     vol.Coerce(int), vol.Range(min=300)
                 ),
             }
         )
 
-    async def _abort_if_email_configured(self) -> None:
-        """Abort if the account email is already configured."""
-        normalized_email = self._email.lower().strip()
-        await self.async_set_unique_id(normalized_email)
-        self._abort_if_unique_id_configured()
+    async def _async_validate_cookies(self, cookies: dict):
+        """
+        Validate cookies by calling /user-data.
 
-    def _make_request(self, url, method="GET", data=None, headers=None):
-        """Execute a urllib.request in a thread pool to avoid blocking."""
-        if headers is None:
-            headers = {}
-        request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cookie_jar))
-        try:
-            with opener.open(request, timeout=10) as response:
-                body = response.read().decode("utf-8", errors="ignore")
-                return response.status, body, response.url, dict(response.headers)
-        except Exception as err:
-            _LOGGER.error(f"Request failed for {url}: {err}")
-            raise
+        Returns (customer_id, cache_session) on success,
+        or (None, "") if the session is rejected.
+        Raises on network/unexpected errors.
+        """
+        session = aiohttp_client.async_get_clientsession(self.hass)
+        session.cookie_jar.update_cookies(cookies, URL(_UTILITA_BASE))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-App-Name": "my.utilita",
+            "X-App-Version": "production",
+        }
+        async with session.get(
+            f"{_UTILITA_BASE}/user-data",
+            timeout=15,
+            headers=headers,
+            allow_redirects=False,
+        ) as resp:
+            # A redirect (to /login) or 401/403 means the cookies are invalid/expired.
+            if resp.status in (301, 302, 303, 307, 308, 401, 403):
+                return None, ""
+            if resp.status != 200:
+                raise Exception(f"Unexpected HTTP {resp.status} from /user-data")
+            data = await resp.json(content_type=None)
+            customer_id = data.get("customer_id")
+            if not customer_id:
+                return None, ""
+            return str(customer_id), resp.headers.get("Cache-Session", "")
 
     async def async_step_user(self, user_input=None) -> FlowResult:
-        """Handle the initial step."""
+        """Handle the initial setup step."""
         errors = {}
-        if user_input is not None:
-            self._email = user_input[CONF_EMAIL].strip()
-            self._password = user_input[CONF_PASSWORD]
-            self._refresh_rate = user_input[CONF_REFRESH_RATE]
 
-            await self._abort_if_email_configured()
+        if user_input is not None:
+            cookies_raw = user_input[_CONF_COOKIES_RAW].strip()
+            self._cookies = _parse_cookie_string(cookies_raw)
+            refresh_rate = user_input[CONF_REFRESH_RATE]
 
             try:
-                # GET login page
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                }
-                status, login_page, url, response_headers = await self.hass.async_add_executor_job(
-                    self._make_request, "https://my.utilita.co.uk/login", "GET", None, headers
-                )
-                if status != 200:
-                    errors["base"] = "cannot_connect"
-                    return self.async_show_form(
-                        step_id="user",
-                        data_schema=self._user_schema(self._refresh_rate),
-                        errors=errors,
+                customer_id, cache_session = await self._async_validate_cookies(self._cookies)
+                if customer_id is None:
+                    errors["base"] = "invalid_cookies"
+                else:
+                    await self.async_set_unique_id(customer_id)
+                    self._abort_if_unique_id_configured()
+                    return self.async_create_entry(
+                        title="Utilita Energy",
+                        data={
+                            CONF_REFRESH_RATE: refresh_rate,
+                            "cookies": self._cookies,
+                            "cache_session": cache_session,
+                        },
                     )
-
-                match = re.search(r'<input type="hidden" name="_token" value="([^"]+)"', login_page)
-                if not match:
-                    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', login_page, re.IGNORECASE)
-                if not match:
-                    _LOGGER.error("CSRF token not found in login page")
-                    errors["base"] = "cannot_connect"
-                    return self.async_show_form(
-                        step_id="user",
-                        data_schema=self._user_schema(self._refresh_rate),
-                        errors=errors,
-                    )
-                self._token = match.group(1)
-
-                # Extract XSRF-TOKEN from cookies
-                for cookie in self._cookie_jar:
-                    if cookie.name == "XSRF-TOKEN" and "my.utilita.co.uk" in cookie.domain:
-                        self._xsrf_token = cookie.value
-                        break
-
-                # Perform login
-                login_data = urllib.parse.urlencode({
-                    "_token": self._token,
-                    "email": self._email,
-                    "password": self._password,
-                    "remember": "on",
-                }).encode("utf-8")
-
-                login_headers = {
-                    "User-Agent": headers["User-Agent"],
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Referer": "https://my.utilita.co.uk/login",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                }
-
-                status, response_text, url, response_headers = await self.hass.async_add_executor_job(
-                    self._make_request, "https://my.utilita.co.uk/login", "POST", login_data, login_headers
-                )
-
-                if status != 200:
-                    errors["base"] = "invalid_auth"
-                    return self.async_show_form(
-                        step_id="user",
-                        data_schema=self._user_schema(self._refresh_rate),
-                        errors=errors,
-                    )
-
-                # Check if MFA/OTP is required
-                if "otp-login" in str(url) or "otp-login" in response_text or "#OTP-form" in str(url):
-                    return await self.async_step_mfa_method()
-
-                # Successful login without MFA
-                return self.async_create_entry(
-                    title="Utilita Energy",
-                    data={
-                        CONF_EMAIL: self._email,
-                        CONF_PASSWORD: self._password,
-                        CONF_REFRESH_RATE: self._refresh_rate,
-                        "cookies": {cookie.name: cookie.value for cookie in self._cookie_jar if "my.utilita.co.uk" in cookie.domain},
-                        "cache_session": response_headers.get("Cache-Session", ""),
-                    },
-                )
-
-            except Exception as err:
-                _LOGGER.exception("Unexpected exception in async_step_user")
-                errors["base"] = "unknown"
-                return self.async_show_form(
-                    step_id="user",
-                    data_schema=self._user_schema(self._refresh_rate),
-                    errors=errors,
-                )
+            except Exception:
+                _LOGGER.exception("Unexpected error validating Utilita cookies")
+                errors["base"] = "cannot_connect"
 
         return self.async_show_form(
             step_id="user",
@@ -172,131 +123,51 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_mfa_method(self, user_input=None):
-        """Choose SMS or Email for the OTP."""
-        errors = {}
-
-        if user_input is not None:
-            self._mfa_method = user_input["mfa_method"]
-
-            payload = {"method": self._mfa_method.upper()}
-            if self._mfa_method == "email":
-                payload["email"] = self._email
-                self._mfa_target_display = self._email
-            else:
-                self._mfa_target_display = "your registered mobile number"
-
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Content-Type": "application/json;charset=UTF-8",
-                "Origin": "https://my.utilita.co.uk",
-                "Referer": "https://my.utilita.co.uk/login",
-                "x-app-name": "my.utilita",
-                "x-app-version": "production",
-                "x-csrf-token": self._token,
-                "x-requested-with": "XMLHttpRequest",
-                "x-xsrf-token": self._xsrf_token or "",
-            }
-
-            try:
-                status, response_text, _, _ = await self.hass.async_add_executor_job(
-                    self._make_request,
-                    "https://my.utilita.co.uk/login/otp/resend",
-                    "POST",
-                    json.dumps(payload).encode("utf-8"),
-                    headers,
-                )
-
-                if status == 200 and json.loads(response_text).get("success", False):
-                    return await self.async_step_otp()
-                else:
-                    errors["base"] = "otp_failed"
-            except Exception:
-                errors["base"] = "cannot_connect"
-
-        return self.async_show_form(
-            step_id="mfa_method",
-            data_schema=vol.Schema({
-                vol.Required("mfa_method", default="email"): vol.In({
-                    "email": f"Email (to {self._email})",
-                    "sms": "SMS (to your phone)",
-                })
-            }),
-            errors=errors,
-            description_placeholders={
-                "message": "Please choose how you would like to receive your security code."
-            }
-        )
-
-    async def async_step_otp(self, user_input=None):
-        """Enter the OTP code."""
-        errors = {}
-
-        if user_input is not None:
-            otp_code = user_input["otp_code"].strip()
-
-            if len(otp_code) != 6 or not otp_code.isdigit():
-                errors["base"] = "invalid_otp"
-            else:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Content-Type": "application/json;charset=UTF-8",
-                    "Origin": "https://my.utilita.co.uk",
-                    "Referer": "https://my.utilita.co.uk/login",
-                    "x-app-name": "my.utilita",
-                    "x-app-version": "production",
-                    "x-csrf-token": self._token,
-                    "x-requested-with": "XMLHttpRequest",
-                    "x-xsrf-token": self._xsrf_token or "",
-                }
-
-                payload = json.dumps({
-                    "OTP": otp_code,
-                    "email": self._email,
-                    "password": self._password
-                }).encode("utf-8")
-
-                try:
-                    status, response_text, _, response_headers = await self.hass.async_add_executor_job(
-                        self._make_request,
-                        "https://my.utilita.co.uk/login/otp",
-                        "POST",
-                        payload,
-                        headers,
-                    )
-
-                    if status == 200 and json.loads(response_text).get("success", False):
-                        return self.async_create_entry(
-                            title="Utilita Energy",
-                            data={
-                                CONF_EMAIL: self._email,
-                                CONF_PASSWORD: self._password,
-                                CONF_REFRESH_RATE: self._refresh_rate,
-                                "cookies": {cookie.name: cookie.value for cookie in self._cookie_jar if "my.utilita.co.uk" in cookie.domain},
-                                "cache_session": response_headers.get("Cache-Session", ""),
-                            },
-                        )
-                except Exception:
-                    pass
-
-                errors["base"] = "invalid_otp"
-
-        return self.async_show_form(
-            step_id="otp",
-            data_schema=vol.Schema({vol.Required("otp_code"): str}),
-            errors=errors,
-            description_placeholders={
-                "target": self._mfa_target_display or self._email
-            },
-        )
-
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
         """Return the options flow handler."""
         return UtilitaOptionsFlow(config_entry)
+
+    async def async_step_reauth(self, entry_data) -> FlowResult:
+        """Initiate re-authentication when the stored session has expired."""
+        self._reauth_entry = self.hass.config_entries.async_get_entry(
+            self.context["entry_id"]
+        )
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None) -> FlowResult:
+        """Re-authentication form — paste fresh cookies to restore the session."""
+        errors = {}
+
+        if user_input is not None:
+            cookies_raw = user_input[_CONF_COOKIES_RAW].strip()
+            self._cookies = _parse_cookie_string(cookies_raw)
+
+            try:
+                customer_id, cache_session = await self._async_validate_cookies(self._cookies)
+                if customer_id is None:
+                    errors["base"] = "invalid_cookies"
+                else:
+                    updated_data = {
+                        **self._reauth_entry.data,
+                        "cookies": self._cookies,
+                        "cache_session": cache_session,
+                    }
+                    self.hass.config_entries.async_update_entry(
+                        self._reauth_entry, data=updated_data
+                    )
+                    await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
+                    return self.async_abort(reason="reauth_successful")
+            except Exception:
+                _LOGGER.exception("Unexpected error during Utilita re-authentication")
+                errors["base"] = "cannot_connect"
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(_CONF_COOKIES_RAW): str}),
+            errors=errors,
+        )
 
 
 class UtilitaOptionsFlow(config_entries.OptionsFlow):
