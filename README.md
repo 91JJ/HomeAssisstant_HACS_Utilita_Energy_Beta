@@ -11,7 +11,7 @@ A lot of the data is stored within the Attributes so may require other integrati
 ## Changelog — v3.0.0
 
 - **Device card fix** — Sensors are now correctly grouped under a single **Utilita Energy** device card in **Settings → Devices & Services**. Previously, a race condition caused an entity-less device to be created before sensors were registered, which Home Assistant 2025.x filtered from the UI.
-- **Cookie-based authentication** — The login flow has been completely removed. No email, password, MFA, OTP, or Cloudflare cookies are needed. You log into the Utilita website normally in your browser and paste the resulting session cookies into Home Assistant. This approach is simpler, more reliable, and immune to Cloudflare changes. See the **[Setup section below](#setup--getting-your-session-cookies)** for instructions.
+- **Cookie-based authentication** — The login flow has been completely removed. No email, password, MFA, OTP. You log into the Utilita website normally in your browser and paste the resulting session cookies into Home Assistant. This approach is simpler and more reliable.. See the **[Setup section below](#setup--getting-your-session-cookies)** for instructions.
 - **MFA / OTP support removed** — No longer needed since the integration no longer performs a login at all.
 
 ## Setup — Getting Your Session Cookies
@@ -88,7 +88,6 @@ Utilita session cookies typically last **several weeks to months** (they are set
 - [x] Open Beta. :tada:
 - [X] Create icon & publish to Brands. (Completed :tada: - https://github.com/home-assistant/brands/pull/7248#pullrequestreview-2967758252)
 - [X] Add support for Multi-factor Authentication (MFA). (Completed :tada:)
-- [X] Handle Cloudflare Turnstile via cookie-based authentication. (Completed :tada: v2.4.0)
 - [ ] Add Service Call to update sensors on request.
 - [ ] Add to Home Assistant Integrations.
 - [x] Fix deprecated options flow config entry assignment.
