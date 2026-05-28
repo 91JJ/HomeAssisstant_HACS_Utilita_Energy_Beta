@@ -1,6 +1,5 @@
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.const import UnitOfEnergy, EntityCategory
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 import re
 from .const import DOMAIN
@@ -30,13 +29,7 @@ class UtilitaAccountSensor(CoordinatorEntity, SensorEntity):
         self._entry_id = entry_id
         self._attr_icon = "mdi:account-details"
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
@@ -88,13 +81,7 @@ class UtilitaBalanceSensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = "mdi:fire" if supply_type == "gas" else "mdi:lightning-bolt-outline"
         self._attr_suggested_display_precision = 2
         self._attr_unit_of_measurement = "£"
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
@@ -188,13 +175,7 @@ class UtilitaUsageSensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = "mdi:fire" if supply_type == "gas" else "mdi:lightning-bolt-outline"
         self._attr_suggested_display_precision = 3
         self._attr_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
@@ -298,13 +279,7 @@ class UtilitaTariffSensor(CoordinatorEntity, SensorEntity):
         self._name = name
         self._attr_icon = "mdi:fire" if supply_type == "gas" else "mdi:lightning-bolt-outline"
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
@@ -380,13 +355,7 @@ class UtilitaCurrentRateSensor(CoordinatorEntity, SensorEntity):
         self._name = name
         self._attr_icon = "mdi:fire-circle" if supply_type == "gas" else "mdi:lightning-bolt-circle"
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
@@ -457,13 +426,7 @@ class UtilitaPaymentsSensor(CoordinatorEntity, SensorEntity):
         self._entry_id = entry_id
         self._attr_icon = "mdi:currency-gbp"
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
@@ -518,13 +481,7 @@ class UtilitaMessagesSensor(CoordinatorEntity, SensorEntity):
         self._entry_id = entry_id
         self._attr_icon = "mdi:email-outline"
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, f"utilita_{entry_id}")},
-            name="Utilita Energy",
-            manufacturer="Utilita",
-            model="Energy Monitor",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def name(self):
