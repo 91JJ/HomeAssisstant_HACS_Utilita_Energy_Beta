@@ -13,7 +13,6 @@ A lot of the data is stored within the Attributes so may require other integrati
 - **Device card fix** — Sensors are now correctly grouped under a single **Utilita Energy** device card in **Settings → Devices & Services**. Previously, a race condition caused an entity-less device to be created before sensors were registered, which Home Assistant 2025.x filtered from the UI.
 - **Cookie-based authentication** — The login flow has been completely removed. No email, password, MFA, OTP, or Cloudflare cookies are needed. You log into the Utilita website normally in your browser and paste the resulting session cookies into Home Assistant. This approach is simpler, more reliable, and immune to Cloudflare changes. See the **[Setup section below](#setup--getting-your-session-cookies)** for instructions.
 - **MFA / OTP support removed** — No longer needed since the integration no longer performs a login at all.
-- **Cloudflare `cf_clearance` workaround removed** — Superseded by the cookie-based approach.
 
 ## Setup — Getting Your Session Cookies
 
