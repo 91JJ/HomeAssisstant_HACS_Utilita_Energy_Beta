@@ -1,3 +1,5 @@
+import asyncio
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -6,7 +8,10 @@ from homeassistant.helpers.event import async_track_time_interval
 import re
 import logging
 from datetime import timedelta, date, datetime
-from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REFRESH_RATE
+from .const import (
+    CONF_REFRESH_RATE,
+    DOMAIN,
+)
 import json
 import async_timeout
 import time
@@ -32,8 +37,6 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         """Initialize."""
         self.hass = hass
         self.config_entry = entry
-        self.email = entry.data[CONF_EMAIL]
-        self.password = entry.data[CONF_PASSWORD]
         self.cookies = entry.data.get("cookies", {})
         self.cache_session = entry.data.get("cache_session", "")
         self.login_retry_after = None
@@ -49,8 +52,20 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=entry.options.get(CONF_REFRESH_RATE, entry.data.get(CONF_REFRESH_RATE, 7200))),
         )
 
+    @property
+    def device_info(self):
+        """Return device registry info for this integration."""
+        from homeassistant.helpers.device_registry import DeviceInfo, DeviceEntryType
+        return DeviceInfo(
+            entry_type=DeviceEntryType.SERVICE,
+            identifiers={(DOMAIN, self.config_entry.entry_id)},
+            name="Utilita Energy",
+            manufacturer="Utilita",
+            model="Energy Monitor",
+        )
+
     def _async_apply_cookies(self, session):
-        """Apply stored cookies to the shared HTTP session."""
+        """Apply stored session cookies to the shared HTTP session."""
         if self.cookies:
             session.cookie_jar.update_cookies(self.cookies, UTILITA_BASE_URL)
 
@@ -163,27 +178,26 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         }
 
     async def _async_ensure_authenticated(self, session):
-        """Ensure the stored session is valid, logging in again if needed."""
+        """Ensure the stored session is valid; trigger re-authentication if not."""
         if self.login_retry_after and time.time() < self.login_retry_after:
             expiry = datetime.fromtimestamp(self.login_retry_after).strftime('%Y-%m-%d %H:%M:%S')
-            _LOGGER.warning(f"Login retry delay in effect until {expiry}. Skipping login.")
-            raise UpdateFailed(f"Login retry delay in effect until {expiry}. Please try again later.")
+            raise UpdateFailed(f"Re-authentication required. Retries paused until {expiry}.")
 
         self._async_apply_cookies(session)
 
         if not self.cookies:
-            _LOGGER.debug("No stored cookies, proceeding with login.")
-            await self._async_login(session)
-            return
+            _LOGGER.debug("No session cookies stored.")
+            await self._async_trigger_session_reauth()
+            raise UpdateFailed("No session cookies stored. Re-authentication required.")
 
-        _LOGGER.debug(f"Loaded stored session state: {_log_session_state(self.cookies, self.cache_session)}")
+        _LOGGER.debug("Loaded stored session state: %s", _log_session_state(self.cookies, self.cache_session))
         if not self.session_validated or (time.time() - self.last_session_check) > 3600:
             self.session_validated = await self._async_validate_session(session)
             self.last_session_check = time.time()
-            _LOGGER.debug(f"Session validation result: {self.session_validated}")
+            _LOGGER.debug("Session validation result: %s", self.session_validated)
             if not self.session_validated:
-                _LOGGER.debug("Session invalid, attempting to log in again.")
-                await self._async_login(session)
+                await self._async_trigger_session_reauth()
+                raise UpdateFailed("Session cookies expired. Re-authentication required.")
 
     async def _async_request(self, session, url, error_message, response_type="json"):
         """Perform an authenticated GET request, retrying once after re-login on 401."""
@@ -193,20 +207,9 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
 
         async with session.get(url, timeout=10, headers=headers) as response:
             if response.status == 401:
-                _LOGGER.debug(f"Session invalid during request to {url}, attempting to log in again.")
-                self.session_validated = False
-                await self._async_login(session)
-                retry_headers = self._build_api_headers(
-                    accept="application/json" if response_type == "json" else "text/plain, */*"
-                )
-                async with session.get(url, timeout=10, headers=retry_headers) as retry_response:
-                    if retry_response.status != 200:
-                        raise UpdateFailed(f"{error_message} after login: HTTP {retry_response.status}")
-                    self._async_store_session(
-                        session,
-                        retry_response.headers.get("Cache-Session", self.cache_session),
-                    )
-                    return await retry_response.json() if response_type == "json" else await retry_response.text()
+                _LOGGER.debug("Session expired (401) during request to %s. Triggering re-authentication.", url)
+                await self._async_trigger_session_reauth()
+                raise UpdateFailed(f"{error_message}: session expired (HTTP 401). Re-authentication required.")
 
             if response.status != 200:
                 raise UpdateFailed(f"{error_message}: HTTP {response.status}")
@@ -217,81 +220,39 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
             )
             return await response.json() if response_type == "json" else await response.text()
 
-    async def _async_login(self, session):
-        """Perform login to refresh session."""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        async with session.get("https://my.utilita.co.uk/login", timeout=10, headers=headers, allow_redirects=True) as response:
-            if response.status != 200:
-                raise UpdateFailed(f"Failed to load login page: HTTP {response.status}, URL: {response.url}")
-            login_page = await response.text()
-            _LOGGER.debug(f"Login page URL: {response.url}")
-            match = re.search(r'<input type="hidden" name="_token" value="([^"]+)"', login_page)
-            if not match:
-                match = re.search(r'<meta name="csrf-token" content="([^"]+)"', login_page, re.IGNORECASE)
-            if not match:
-                snippet = login_page[:1000]
-                _LOGGER.error(f"CSRF token not found. Login page snippet: {snippet}")
-                raise UpdateFailed("CSRF token not found")
-            token = match.group(1)
-            _LOGGER.debug("CSRF token found")
-            xsrf_token = None
-            for cookie in session.cookie_jar.filter_cookies(UTILITA_BASE_URL).values():
-                if cookie.key == "XSRF-TOKEN":
-                    xsrf_token = cookie.value
-                    _LOGGER.debug("XSRF token found")
-                    break
-            _LOGGER.debug(f"Cookies received after login page: {len(response.cookies)}")
+    async def _async_trigger_session_reauth(self):
+        """Notify the user that session cookies have expired and trigger re-authentication."""
+        self.session_validated = False
+        self.retry_attempts += 1
+        backoff = min(300 * 2 ** (self.retry_attempts - 1), 3600)
+        self.login_retry_after = time.time() + backoff
+        expiry = datetime.fromtimestamp(self.login_retry_after).strftime('%Y-%m-%d %H:%M:%S')
+        _LOGGER.warning(
+            "Utilita session cookies expired for entry %s. Re-authentication required. Retries paused until %s.",
+            self.config_entry.entry_id,
+            expiry,
+        )
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "notification_id": f"utilita_reauth_{self.config_entry.entry_id}",
+                "title": "Utilita - Session Expired",
+                "message": (
+                    "Your Utilita session cookies have expired and data can no longer be fetched.\n\n"
+                    "To restore the connection:\n"
+                    "1. Open your browser and log into **https://my.utilita.co.uk**\n"
+                    "2. Press **F12** to open DevTools → **Network** tab → reload the page → "
+                    "click any request to `my.utilita.co.uk` → **Request Headers** → "
+                    "copy the entire **Cookie** header value\n"
+                    "3. Go to **Settings → Devices & Services → Utilita → Re-authenticate** "
+                    "and paste the cookie string\n\n"
+                    f"Automatic retries paused until {expiry}."
+                ),
+            },
+        )
+        self.config_entry.async_start_reauth(self.hass)
 
-        async with session.post(
-            "https://my.utilita.co.uk/login",
-            data={"_token": token, "email": self.email, "password": self.password, "remember": "on"},
-            timeout=10,
-            headers={
-                "User-Agent": headers["User-Agent"],
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-GB,en;q=0.9",
-                "Referer": "https://my.utilita.co.uk/login",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-        ) as response:
-            response_text = await response.text()
-            if response.status != 200:
-                raise UpdateFailed(f"Login failed: HTTP {response.status}, URL: {response.url}")
-            _LOGGER.debug(f"Cookies received after login: {len(response.cookies)}")
-            if "otp-login" in str(response.url) or "otp-login" in response_text or "#OTP-form" in str(response.url):
-                self.retry_attempts += 1
-                # Exponential backoff: 5min, 15min, 30min, 60min
-                backoff = min(300 * 2 ** (self.retry_attempts - 1), 3600)  # Cap at 1 hour
-                self.login_retry_after = time.time() + backoff
-                expiry = datetime.fromtimestamp(self.login_retry_after).strftime('%Y-%m-%d %H:%M:%S')
-                await self.hass.services.async_call(
-                    "persistent_notification",
-                    "create",
-                    {
-                        "title": "Utilita Login Requires OTP",
-                        "message": f"OTP required for {self.email}. Please re-authenticate the Utilita integration in Home Assistant. Delaying retries until {expiry}.",
-                    },
-                )
-                _LOGGER.warning(f"OTP required during login. Delaying retries until {expiry}.")
-                raise UpdateFailed("OTP required, but background tasks cannot prompt for OTP")
-            # Reset retry attempts on successful login
-            self.retry_attempts = 0
-            # Update cookies and cache session
-            self._async_store_session(
-                session,
-                response.headers.get("Cache-Session", self.cache_session),
-            )
-            _LOGGER.debug(f"Updated session state: {_log_session_state(self.cookies, self.cache_session)}")
-            self.session_validated = True
-            self.last_session_check = time.time()
 
     async def _async_validate_session(self, session):
         """Validate session by checking a lightweight endpoint."""
@@ -393,10 +354,8 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Utilita from a config entry."""
-    email = entry.data[CONF_EMAIL]
-    password = entry.data[CONF_PASSWORD]
     refresh_rate = entry.options.get(CONF_REFRESH_RATE, entry.data.get(CONF_REFRESH_RATE, 7200))
-    _LOGGER.debug(f"Setting up entry {entry.entry_id} with refresh_rate: {refresh_rate} seconds")
+    _LOGGER.debug("Setting up entry %s with refresh_rate: %s seconds", entry.entry_id, refresh_rate)
 
     coordinator = UtilitaDataUpdateCoordinator(hass, entry)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"coordinator": coordinator, "config": entry}
@@ -405,22 +364,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error(f"Initial refresh failed for entry {entry.entry_id}")
         return False
     coordinator._async_configure_keepalive()
-
-    # Explicitly create the device (fixes the missing device issue in HA 2025.x)
-    from homeassistant.helpers import device_registry as dr
-    from homeassistant.helpers.device_registry import DeviceEntryType
-    device_registry = dr.async_get(hass)
-    device_registry.async_get_or_create(
-        config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, f"utilita_{entry.entry_id}")},
-        name="Utilita Energy",
-        manufacturer="Utilita",
-        model="Energy Monitor",
-        entry_type=DeviceEntryType.SERVICE,
-    )
-
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
