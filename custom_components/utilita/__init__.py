@@ -1,4 +1,5 @@
 import asyncio
+from aiohttp import CookieJar
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -36,6 +37,10 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
     def __init__(self, hass, entry):
         """Initialize."""
         self.hass = hass
+        # Utilita multi-property session isolation: one cookie jar/session per Utilita property.
+        self._session = aiohttp_client.async_create_clientsession(
+            hass, cookie_jar=CookieJar()
+        )
         self.config_entry = entry
         self.cookies = entry.data.get("cookies", {})
         self.cache_session = entry.data.get("cache_session", "")
@@ -56,16 +61,24 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
     def device_info(self):
         """Return device registry info for this integration."""
         from homeassistant.helpers.device_registry import DeviceInfo, DeviceEntryType
+        user_data = (self.data or {}).get("user_data") or {}
+        premises = user_data.get("premises") or []
+        address = (
+            premises[0].get("addr_full")
+            if premises and isinstance(premises[0], dict)
+            else None
+        )
+        device_name = f"Utilita Energy - {address}" if address else self.config_entry.title
         return DeviceInfo(
             entry_type=DeviceEntryType.SERVICE,
             identifiers={(DOMAIN, self.config_entry.entry_id)},
-            name="Utilita Energy",
+            name=device_name,
             manufacturer="Utilita",
             model="Energy Monitor",
         )
 
     def _async_apply_cookies(self, session):
-        """Apply stored session cookies to the shared HTTP session."""
+        """Apply stored cookies to this property's private HTTP session."""
         if self.cookies:
             session.cookie_jar.update_cookies(self.cookies, UTILITA_BASE_URL)
 
@@ -128,7 +141,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
 
         self._keepalive_in_progress = True
         try:
-            session = aiohttp_client.async_get_clientsession(self.hass)
+            session = self._session
             self._async_apply_cookies(session)
             headers = self._build_api_headers()
             async with async_timeout.timeout(15):
@@ -279,7 +292,7 @@ class UtilitaDataUpdateCoordinator(DataUpdateCoordinator):
         _LOGGER.debug(f"Starting data update for entry {self.config_entry.entry_id} at {date.today()} {self.update_interval}")
         try:
             async with async_timeout.timeout(30):
-                session = aiohttp_client.async_get_clientsession(self.hass)
+                session = self._session
                 await self._async_ensure_authenticated(session)
 
                 balance = await self._async_request(
