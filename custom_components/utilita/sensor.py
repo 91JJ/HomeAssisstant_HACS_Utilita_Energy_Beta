@@ -418,60 +418,6 @@ class UtilitaCurrentRateSensor(CoordinatorEntity, SensorEntity):
     def available(self):
         return self.coordinator.last_update_success
 
-class UtilitaPaymentsSensor(CoordinatorEntity, SensorEntity):
-    """Representation of the Utilita payments sensor."""
-
-    def __init__(self, coordinator, entry_id):
-        super().__init__(coordinator)
-        self._entry_id = entry_id
-        self._attr_icon = "mdi:currency-gbp"
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = coordinator.device_info
-
-    @property
-    def name(self):
-        return "Payments"
-
-    @property
-    def unique_id(self):
-        return f"utilita_{self._entry_id}_payments"
-
-    @property
-    def state(self):
-        try:
-            payments = self.coordinator.data["payments"]["payments"]
-            return len(payments)
-        except (KeyError, TypeError) as err:
-            _LOGGER.error(f"Error parsing payments list: {err}")
-            return None
-
-    @property
-    def extra_state_attributes(self):
-        try:
-            payments = self.coordinator.data["payments"]["payments"]
-            grouped_payments = {}
-            for payment in payments:
-                date = payment["issuetime"].split("T")[0]
-                if date not in grouped_payments:
-                    grouped_payments[date] = []
-                payment_details = {
-                    "type": payment["type"],
-                    "amount": format_amount(payment["metercreditamount"]),
-                    "debt_deducted": format_amount(payment.get("debtdeducted", 0)),
-                    "debt_recovery_rate": payment.get("debtrecoveryrate", 0),
-                    "transaction_amount": format_amount(payment["transactionamount"]),
-                    "full_description": payment["full_description"].strip(),
-                    "issuetime": payment["issuetime"],
-                }
-                grouped_payments[date].append(payment_details)
-            return grouped_payments
-        except (KeyError, TypeError) as err:
-            _LOGGER.error(f"Error parsing payments attributes: {err}")
-            return {}
-
-    @property
-    def available(self):
-        return self.coordinator.last_update_success
 
 class UtilitaMessagesSensor(CoordinatorEntity, SensorEntity):
     """Representation of the Utilita unread messages sensor."""
@@ -511,6 +457,38 @@ class UtilitaMessagesSensor(CoordinatorEntity, SensorEntity):
     def available(self):
         return self.coordinator.last_update_success
 
+def _utilita_detect_supply_types(data):
+    """Return available fuels from account metadata, or None if unknown.
+
+    Do not infer absence of gas from an incomplete balance/usage API response.
+    """
+    if not isinstance(data, dict):
+        return None
+    user_data = data.get("user_data")
+    if not isinstance(user_data, dict):
+        return None
+    premises = user_data.get("premises")
+    if not isinstance(premises, list) or not premises:
+        return None
+    property_data = premises[0]
+    if not isinstance(property_data, dict):
+        return None
+    supplies = property_data.get("supplies")
+    if not isinstance(supplies, list) or not supplies:
+        return None
+
+    available = set()
+    for supply in supplies:
+        if not isinstance(supply, dict):
+            continue
+        supply_type = str(supply.get("type") or "").strip().lower()
+        if supply_type in ("elec", "electric", "electricity"):
+            available.add("elec")
+        elif supply_type == "gas":
+            available.add("gas")
+    return available or None
+
+
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up the Utilita sensors."""
     coordinator = hass.data[DOMAIN][config_entry.entry_id]["coordinator"]
@@ -533,8 +511,26 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         UtilitaTariffSensor(coordinator, entry_id, "elec", "Electricity Tariff"),
         UtilitaCurrentRateSensor(coordinator, entry_id, "gas", "Current Gas Rate"),
         UtilitaCurrentRateSensor(coordinator, entry_id, "elec", "Current Electric Rate"),
-        UtilitaPaymentsSensor(coordinator, entry_id),
         UtilitaMessagesSensor(coordinator, entry_id),
     ])
+
+    # Utilita supply-aware entity setup: skip sensors for unavailable fuels.
+    available_supply_types = _utilita_detect_supply_types(coordinator.data)
+    if available_supply_types is not None:
+        sensors = [
+            sensor for sensor in sensors
+            if getattr(sensor, "_supply_type", None) in (None, *available_supply_types)
+        ]
+        _LOGGER.info(
+            "Utilita entry %s: registering sensors for %s",
+            entry_id,
+            ", ".join(sorted(available_supply_types)),
+        )
+    else:
+        # Avoid hiding a legitimate supply if account metadata is incomplete.
+        _LOGGER.warning(
+            "Utilita entry %s: supply types unknown; retaining original sensors",
+            entry_id,
+        )
 
     async_add_entities(sensors)
