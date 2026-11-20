@@ -2,6 +2,7 @@
 import logging
 
 import voluptuous as vol
+from aiohttp import CookieJar
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
@@ -59,7 +60,10 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         or (None, "") if the session is rejected.
         Raises on network/unexpected errors.
         """
-        session = aiohttp_client.async_get_clientsession(self.hass)
+        # Utilita multi-property session isolation: validate without touching any other account.
+        session = aiohttp_client.async_create_clientsession(
+            self.hass, cookie_jar=CookieJar()
+        )
         session.cookie_jar.update_cookies(cookies, URL(_UTILITA_BASE))
         headers = {
             "User-Agent": (
@@ -72,22 +76,25 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "X-App-Name": "my.utilita",
             "X-App-Version": "production",
         }
-        async with session.get(
-            f"{_UTILITA_BASE}/user-data",
-            timeout=15,
-            headers=headers,
-            allow_redirects=False,
-        ) as resp:
-            # A redirect (to /login) or 401/403 means the cookies are invalid/expired.
-            if resp.status in (301, 302, 303, 307, 308, 401, 403):
-                return None, ""
-            if resp.status != 200:
-                raise Exception(f"Unexpected HTTP {resp.status} from /user-data")
-            data = await resp.json(content_type=None)
-            customer_id = data.get("customer_id")
-            if not customer_id:
-                return None, ""
-            return str(customer_id), resp.headers.get("Cache-Session", "")
+        try:
+            async with session.get(
+                f"{_UTILITA_BASE}/user-data",
+                timeout=15,
+                headers=headers,
+                allow_redirects=False,
+            ) as resp:
+                # A redirect (to /login) or 401/403 means the cookies are invalid/expired.
+                if resp.status in (301, 302, 303, 307, 308, 401, 403):
+                    return None, ""
+                if resp.status != 200:
+                    raise Exception(f"Unexpected HTTP {resp.status} from /user-data")
+                data = await resp.json(content_type=None)
+                customer_id = data.get("customer_id")
+                if not customer_id:
+                    return None, ""
+                return str(customer_id), resp.headers.get("Cache-Session", "")
+        finally:
+            session.detach()
 
     async def async_step_user(self, user_input=None) -> FlowResult:
         """Handle the initial setup step."""
@@ -147,6 +154,13 @@ class UtilitaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 customer_id, cache_session = await self._async_validate_cookies(self._cookies)
                 if customer_id is None:
+                    errors["base"] = "invalid_cookies"
+                elif (
+                    self._reauth_entry.unique_id
+                    and customer_id != self._reauth_entry.unique_id
+                ):
+                    # Prevent cross-property account reassignment.
+                    _LOGGER.warning("Utilita reauth cookies belong to a different account")
                     errors["base"] = "invalid_cookies"
                 else:
                     updated_data = {
